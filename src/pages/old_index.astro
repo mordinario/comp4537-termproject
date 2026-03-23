@@ -1,0 +1,173 @@
+---
+import "../css/style.css"
+---
+
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width" />
+    <meta name="generator" content={Astro.generator} />
+    <title>Speech to Text</title>
+  </head>
+  <body>
+    <div class="container">
+      <h1>Speech → Text</h1>
+      <p class="note">Transcribes in original language. Foreign language? Translation shown below in brackets. (Caches a 150MB model locally.)</p>
+
+      <button id="recordBtn" disabled>Loading model…</button>
+      <p id="status">⏳ Downloading model, please wait…</p>
+      <div id="output">Transcription will appear here…</div>
+      <button id="clearBtn">Clear</button>
+    </div>
+
+    <script type="module">
+      import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2';
+
+      env.allowLocalModels = false;
+      env.useBrowserCache  = true;
+
+      const recordBtn = document.getElementById("recordBtn");
+      const clearBtn  = document.getElementById("clearBtn");
+      const output    = document.getElementById("output");
+      const status    = document.getElementById("status");
+
+      const SILENCE_THRESHOLD = 0.01;
+      const MIN_DURATION_MS   = 1000;
+
+      let transcriber;
+      try {
+        transcriber = await pipeline(
+          "automatic-speech-recognition",
+          "Xenova/whisper-base",
+          {
+            progress_callback: (p) => {
+              if (p.status === "downloading" && p.total) {
+                const pct = Math.round((p.loaded / p.total) * 100);
+                status.textContent = `⏳ Downloading model… ${pct}%`;
+              }
+            }
+          }
+        );
+        status.textContent    = "✅ Model ready. Press record to start.";
+        recordBtn.textContent = "Start Recording";
+        recordBtn.disabled    = false;
+      } catch (err) {
+        status.textContent = `❌ Failed to load model: ${err.message}`;
+      }
+
+      let mediaRecorder = null;
+      let audioChunks   = [];
+      let isRecording   = false;
+      let recordStart   = 0;
+
+      function rms(float32) {
+        let sum = 0;
+        for (let i = 0; i < float32.length; i++) sum += float32[i] ** 2;
+        return Math.sqrt(sum / float32.length);
+      }
+
+      recordBtn.addEventListener("click", async () => {
+        if (isRecording) {
+          mediaRecorder.stop();
+          return;
+        }
+
+        let stream;
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        } catch (err) {
+          status.textContent = `❌ Mic error: ${err.message}`;
+          return;
+        }
+
+        const mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "audio/ogg";
+        mediaRecorder  = new MediaRecorder(stream, { mimeType });
+        audioChunks    = [];
+        recordStart    = Date.now();
+
+        mediaRecorder.ondataavailable = (e) => {
+          if (e.data.size > 0) audioChunks.push(e.data);
+        };
+
+        mediaRecorder.onstop = async () => {
+          stream.getTracks().forEach(t => t.stop());
+
+          if (Date.now() - recordStart < MIN_DURATION_MS) {
+            status.textContent = "⚠️ Recording too short, try again.";
+            resetBtn();
+            return;
+          }
+
+          recordBtn.disabled = true;
+          status.textContent = "⏳ Transcribing…";
+
+          try {
+            const blob        = new Blob(audioChunks, { type: mimeType });
+            const arrayBuffer = await blob.arrayBuffer();
+            const audioCtx    = new AudioContext({ sampleRate: 16000 });
+            const decoded     = await audioCtx.decodeAudioData(arrayBuffer);
+            const float32     = decoded.getChannelData(0);
+
+            if (rms(float32) < SILENCE_THRESHOLD) {
+              status.textContent = "⚠️ No speech detected (too quiet).";
+              resetBtn();
+              return;
+            }
+
+            // pass 1: transcribe in original language
+            const transcribeResult = await transcriber(float32, {
+              sampling_rate: 16000,
+            });
+            const originalText = transcribeResult.text?.trim() ?? "";
+
+            // pass 2: always translate to English
+            status.textContent = "⏳ Translating…";
+            const translateResult = await transcriber(float32, {
+              sampling_rate: 16000,
+              task: "translate",
+            });
+            const translatedText = translateResult.text?.trim() ?? "";
+
+            output.innerHTML = "";
+            const originalEl = document.createElement("div");
+            originalEl.textContent = originalText || "(no speech detected)";
+            output.appendChild(originalEl);
+
+            const normalize = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+            if (translatedText && normalize(translatedText) !== normalize(originalText)) {
+              const translationEl = document.createElement("div");
+              translationEl.className   = "translation";
+              translationEl.textContent = `[${translatedText}]`;
+              output.appendChild(translationEl);
+            }
+
+            status.textContent = "✅ Done.";
+          } catch (err) {
+            status.textContent = `❌ Transcription error: ${err.message}`;
+          }
+
+          resetBtn();
+        };
+
+        mediaRecorder.start();
+        isRecording           = true;
+        recordBtn.textContent = "Stop Recording";
+        recordBtn.classList.add("active");
+        status.textContent    = "🎙️ Recording…";
+      });
+
+      function resetBtn() {
+        recordBtn.disabled    = false;
+        recordBtn.textContent = "Start Recording";
+        recordBtn.classList.remove("active");
+        isRecording = false;
+      }
+
+      clearBtn.addEventListener("click", () => {
+        output.innerHTML   = "Transcription will appear here…";
+        status.textContent = "✅ Model ready. Press record to start.";
+      });
+    </script>
+  </body>
+</html>
